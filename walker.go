@@ -11,14 +11,16 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 /*
-(one)FileWalker generate FDEntry -> channel to Hashers
--> (many)Hashers calculate hash, send FDEntry to Saver
--> (one)Saver: save FDEntry
+(one)FileWalker generate FDEntry -> channel to Saver
+-> (one)Saver: if FDEntry exists with same size and timestamp then skip
+-> else send to (many)Hashers: calculate hash, send FDEntry to Saver
+It can cause triple deadlock
 */
 
 //file-directory entry
@@ -36,6 +38,60 @@ type HashDb struct {
 	currTx       *sql.Tx
 	save_counter int
 }
+
+//
+type FileCounter struct {
+	m            sync.Mutex
+	countInput   int
+	countHash    int
+	walkerActive bool
+}
+
+func NewFileCounter() FileCounter {
+	var fc FileCounter
+	fc.walkerActive = true
+	return fc
+}
+
+func (fc *FileCounter) walkerDone() {
+	fc.m.Lock()
+	defer fc.m.Unlock()
+	fc.walkerActive = false
+}
+
+func (fc *FileCounter) incInput() {
+	fc.m.Lock()
+	defer fc.m.Unlock()
+	fc.countInput++
+}
+
+func (fc *FileCounter) decInput() {
+	fc.m.Lock()
+	defer fc.m.Unlock()
+	fc.countInput--
+}
+
+func (fc *FileCounter) inpToHash() {
+	fc.m.Lock()
+	defer fc.m.Unlock()
+	fc.countInput--
+	fc.countHash++
+}
+
+func (fc *FileCounter) hashToInp() {
+	fc.m.Lock()
+	defer fc.m.Unlock()
+	fc.countInput++
+	fc.countHash--
+}
+
+func (fc *FileCounter) isDone() bool {
+	fc.m.Lock()
+	defer fc.m.Unlock()
+	return !fc.walkerActive && (fc.countInput == 0) && (fc.countHash == 0)
+}
+
+//
 
 func hash_file_md5(filePath string) (string, error) {
 	//Initialize variable returnMD5String now in case an error has to be returned
@@ -86,6 +142,22 @@ func (sv *HashDb) addDir(path string) int {
 		reportFatal(err)
 	}
 	return 0
+}
+
+func (sv *HashDb) getInfo(fd FDEntry) (int64, int64) {
+	var filemod int64
+	var filesize int64
+	parent := sv.addDir(fd.path)
+	rows, err := sv.currTx.Query("select SIZE, LASTMOD from FILES where PARENT=? and FNAME=?",
+		parent, fd.fname)
+	reportFatal(err)
+	defer rows.Close()
+	for rows.Next() {
+		err = rows.Scan(&filesize, &filemod)
+		reportFatal(err)
+	}
+	reportFatal(rows.Err())
+	return filesize, filemod
 }
 
 func (sv *HashDb) addFile(fd FDEntry) {
@@ -269,7 +341,8 @@ func reportFatal(err error) {
 }
 
 // 1.
-func FileWalker(rootPath string, fdOut chan FDEntry, wg *sync.WaitGroup) {
+func FileWalker(rootPath string, fdOut chan<- FDEntry, cntr *FileCounter,
+	wg *sync.WaitGroup) {
 	filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		var fd FDEntry
 		if err != nil {
@@ -277,34 +350,72 @@ func FileWalker(rootPath string, fdOut chan FDEntry, wg *sync.WaitGroup) {
 			return nil
 		}
 		if info.IsDir() {
+			fd.path = path
+			fd.lastmod = info.ModTime().Unix()
+			cntr.incInput()
+			fdOut <- fd
 			return nil
 		}
 		//fmt.Println(path)
 		fd.path, fd.fname = filepath.Split(path)
 		fd.size = info.Size()
 		fd.lastmod = info.ModTime().Unix()
+		cntr.incInput()
+		fmt.Println("FW", filepath.Join(fd.path, fd.fname))
 		fdOut <- fd
 		return nil
 	})
-	close(fdOut)
+	cntr.walkerDone()
 	wg.Done()
 }
 
 // 2.
-func Hasher(fdInp chan FDEntry, fdOut chan FDEntry, wg *sync.WaitGroup) {
+func Hasher(fdInp <-chan FDEntry, fdOut chan<- FDEntry, cntr *FileCounter,
+	wg *sync.WaitGroup) {
+	var err error
 	for fd := range fdInp {
-		fd.hash, _ = hash_file_md5(filepath.Join(fd.path, fd.fname))
+		fmt.Println("HH", filepath.Join(fd.path, fd.fname))
+		fd.hash, err = hash_file_md5(filepath.Join(fd.path, fd.fname))
+		if err != nil {
+			fmt.Println(filepath.Join(fd.path, fd.fname), err)
+			fd.hash = "-"
+		}
+		cntr.hashToInp()
 		fdOut <- fd
 	}
 	wg.Done()
 }
 
 // 3.
-func Saver(hdb *HashDb, fdInp chan FDEntry, wg *sync.WaitGroup) {
+func Saver(hdb *HashDb, fdInp <-chan FDEntry, fdOut chan<- FDEntry,
+	cntr *FileCounter, wg *sync.WaitGroup) {
 	for fd := range fdInp {
 		fmt.Println(filepath.Join(fd.path, fd.fname))
-		hdb.addFile(fd)
-		hdb.Save()
+		if fd.fname == "" {
+			hdb.addDir(fd.path)
+			hdb.Save()
+			cntr.decInput()
+		} else {
+			if fd.size == 0 {
+				hdb.addFile(fd)
+				hdb.Save()
+				cntr.decInput()
+				continue
+			}
+			if fd.hash == "" {
+				fsize, fmod := hdb.getInfo(fd)
+				if (fd.size == fsize) && (fd.lastmod == fmod) {
+					cntr.decInput()
+				} else {
+					cntr.inpToHash()
+					fdOut <- fd
+				}
+			} else {
+				hdb.addFile(fd)
+				hdb.Save()
+				cntr.decInput()
+			}
+		}
 	}
 	hdb.Commit()
 	wg.Done()
@@ -316,7 +427,7 @@ func main() {
 	var livecheck bool
 	var hash_count int
 	var sv HashDb
-	var wg1, wgH sync.WaitGroup
+	var wg1 sync.WaitGroup
 	flag.StringVar(&dbpath, "db", "hash.sqlite", "path to db to save")
 	flag.StringVar(&root_path, "root", "", "root folder to analyze")
 	flag.BoolVar(&livecheck, "livecheck", false, "check files and folders existence")
@@ -326,18 +437,26 @@ func main() {
 	defer sv.Close()
 
 	if root_path > "" {
+		counter := NewFileCounter()
 		walkerChan := make(chan FDEntry, hash_count)
 		hasherChan := make(chan FDEntry, hash_count)
 		wg1.Add(1)
-		go FileWalker(root_path, walkerChan, &wg1)
+		go FileWalker(root_path, walkerChan, &counter, &wg1)
 		wg1.Add(1)
-		go Saver(&sv, hasherChan, &wg1)
+		go Saver(&sv, walkerChan, hasherChan, &counter, &wg1)
 		for i := 0; i < hash_count; i++ {
-			wgH.Add(1)
-			go Hasher(walkerChan, hasherChan, &wgH)
+			wg1.Add(1)
+			go Hasher(hasherChan, walkerChan, &counter, &wg1)
 		}
-		wgH.Wait()
-		close(hasherChan)
+		for {
+			fmt.Printf("%d-%d\n", counter.countInput, counter.countHash)
+			if counter.isDone() {
+				close(walkerChan)
+				close(hasherChan)
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
 		wg1.Wait()
 		sv.Commit()
 		sv.addParents()
