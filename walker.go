@@ -41,15 +41,17 @@ type HashDb struct {
 
 //
 type FileCounter struct {
-	m            sync.Mutex
+	m            sync.RWMutex
 	countInput   int
 	countHash    int
 	walkerActive bool
+	limitInput   int
 }
 
-func NewFileCounter() FileCounter {
+func NewFileCounter(limit int) FileCounter {
 	var fc FileCounter
 	fc.walkerActive = true
+	fc.limitInput = limit
 	return fc
 }
 
@@ -86,9 +88,15 @@ func (fc *FileCounter) hashToInp() {
 }
 
 func (fc *FileCounter) isDone() bool {
-	fc.m.Lock()
-	defer fc.m.Unlock()
+	fc.m.RLock()
+	defer fc.m.RUnlock()
 	return !fc.walkerActive && (fc.countInput == 0) && (fc.countHash == 0)
+}
+
+func (fc *FileCounter) canWalkerSend() bool {
+	fc.m.RLock()
+	defer fc.m.RUnlock()
+	return fc.countInput < fc.limitInput
 }
 
 //
@@ -349,6 +357,9 @@ func FileWalker(rootPath string, fdOut chan<- FDEntry, cntr *FileCounter,
 			log.Println(err)
 			return nil
 		}
+		for !cntr.canWalkerSend() {
+			time.Sleep(time.Microsecond)
+		}
 		if info.IsDir() {
 			fd.path = path
 			fd.lastmod = info.ModTime().Unix()
@@ -437,8 +448,8 @@ func main() {
 	defer sv.Close()
 
 	if root_path > "" {
-		counter := NewFileCounter()
-		walkerChan := make(chan FDEntry, hash_count)
+		counter := NewFileCounter(hash_count)
+		walkerChan := make(chan FDEntry, hash_count*2)
 		hasherChan := make(chan FDEntry, hash_count)
 		wg1.Add(1)
 		go FileWalker(root_path, walkerChan, &counter, &wg1)
